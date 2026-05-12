@@ -134,6 +134,7 @@ class RepoAnalysis(BaseModel):
     """Output schema for Agent 1: Code Analyser."""
 
     repo_url: str
+    branch: str = ""  # branch that was analysed (empty = default branch)
     languages: list[LanguageInfo] = []
     frameworks: list[str] = []
     architecture: Literal[

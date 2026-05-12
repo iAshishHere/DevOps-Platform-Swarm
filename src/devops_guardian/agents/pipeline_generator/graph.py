@@ -1,15 +1,15 @@
 """LangGraph state graph for the Pipeline Generator agent.
 
-Execution is **phased** so that downstream pipelines are only generated
-after their upstream dependency is confirmed green:
+All pipelines are generated in a SINGLE phase:
 
-  Phase 1 — CI + Security  (independent, push-triggered)
-  Phase 2 — Coverage       (depends on CI)
-  Phase 3 — SonarQube      (depends on Coverage)
+  CI pipeline (with test, coverage, and sonarqube as jobs) + Security pipeline.
 
-Each phase runs its own generate → write → push → wait → fix loop.
-If a phase cannot be fixed within ``MAX_FIX_ATTEMPTS``, all later phases
-are skipped.
+This uses ``needs:`` dependencies within one file so all jobs are visible
+on the branch.  After the fix loop validates everything, a restructure
+step splits the combined CI file into separate production files with
+proper ``workflow_run`` triggers.
+
+Generate → write → push → wait → fix loop → restructure → PR.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from devops_guardian.agents.pipeline_generator.generators.pipelines import (
 )
 from devops_guardian.agents.pipeline_generator.generators.platform import resolve_platform
 from devops_guardian.models.analysis import RepoAnalysis
-from devops_guardian.models.pipeline import PipelineFile, PipelineResult
+from devops_guardian.models.pipeline import PipelineConfig, PipelineFile, PipelineResult
 from devops_guardian.utils.github_ops import (
     create_pull_request,
     get_failed_run_logs,
@@ -53,19 +53,17 @@ from devops_guardian.utils.run_logger import RunLogger
 logger = logging.getLogger(__name__)
 
 MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "3"))
-_MAX_PHASE = 3
+_MAX_PHASE = 1  # Single phase — everything generated at once
 
-# Phase → keywords used to identify pipelines that belong to that phase
-# Phases 2/3 modify the CI file (add jobs), so their runs are the CI workflow.
+# Phase → keywords used to identify workflow runs that belong to that phase
 _PHASE_KEYWORDS: dict[int, set[str]] = {
     1: {"ci", "security"},
-    2: {"ci"},       # Coverage is a job inside the CI workflow
-    3: {"ci"},       # SonarQube is also a job inside the CI workflow
 }
 
 
 class PipelineState(TypedDict):
     analysis: dict[str, Any]
+    config: dict[str, Any]       # PipelineConfig — user-selected generation prefs
     platform: str
     pipelines: list[dict[str, Any]]
     clone_path: str
@@ -217,71 +215,93 @@ def resolve_platform_node(state: PipelineState) -> dict:
 # ── Phase-aware generation ──────────────────────────────────────────────────
 
 
-def generate_phase_node(state: PipelineState) -> dict:
-    """Generate pipelines for the current phase only.
-
-    Phase 1: Create CI + Security as separate files.
-    Phase 2: Add a coverage job to the existing CI file.
-    Phase 3: Add a SonarQube job to the existing CI file.
+def _filter_analysis_by_config(
+    analysis: RepoAnalysis, config: PipelineConfig,
+) -> RepoAnalysis:
+    """Return a copy of the analysis with test frameworks filtered by
+    the user-selected categories.  If ``config.test_categories`` is empty,
+    all discovered frameworks are kept (backward-compatible).
     """
-    phase = state.get("current_phase", 1)
-    analysis = RepoAnalysis(**state["analysis"])
+    if not config.test_categories:
+        return analysis
+
+    selected = set(config.test_categories)
+    filtered_frameworks = [
+        fw for fw in analysis.tests.frameworks if fw.category in selected
+    ]
+
+    # Shallow copy with only the filtered test frameworks
+    return analysis.model_copy(
+        update={"tests": analysis.tests.model_copy(
+            update={"frameworks": filtered_frameworks},
+        )},
+    )
+
+
+def generate_phase_node(state: PipelineState) -> dict:
+    """Generate pipelines according to the user-selected config.
+
+    Respects ``PipelineConfig`` flags — only generates pipeline types
+    the user opted into.  Test frameworks are filtered to match
+    the selected categories before being sent to the LLM.
+    """
+    config = PipelineConfig(**state.get("config", {}))
+    analysis_raw = RepoAnalysis(**state["analysis"])
+    analysis = _filter_analysis_by_config(analysis_raw, config)
     platform = state["platform"]
 
-    pipelines = list(state["pipelines"])
-    new_pipelines: list[dict] = []
+    all_pipelines: list[dict[str, Any]] = []
+    enabled: list[str] = []
 
-    if phase == 1:
-        logger.info("Phase 1 — generating CI + Security pipelines.")
-        new_pipelines.append(generate_ci(analysis, platform).model_dump())
-        new_pipelines.append(generate_security(analysis, platform).model_dump())
-    elif phase == 2:
-        logger.info("Phase 2 — adding coverage job to CI pipeline.")
-        # Find the existing CI pipeline
-        ci_idx, ci_entry = next(
-            ((i, p) for i, p in enumerate(pipelines)
-             if "ci" in p.get("description", "").lower()
-             and "security" not in p.get("description", "").lower()),
-            (None, None),
+    # ── CI pipeline (test/build job) ────────────────────────────────────
+    if config.enable_ci:
+        ci_pipeline = generate_ci(analysis, platform)
+        logger.info("  → Base CI pipeline generated.")
+        ci_content = ci_pipeline.content
+
+        # ── Coverage job (added into CI file) ───────────────────────────
+        if config.enable_coverage:
+            ci_with_coverage = generate_coverage_job(analysis, platform, ci_content)
+            logger.info("  → Coverage job added to CI pipeline.")
+            ci_content = ci_with_coverage.content
+            enabled.append("coverage")
+
+        # ── SonarQube job (added into CI file, depends on coverage) ─────
+        if config.enable_sonarqube:
+            ci_combined = generate_sonarqube_job(analysis, platform, ci_content)
+            logger.info("  → SonarQube job added to CI pipeline.")
+            ci_content = ci_combined.content
+            enabled.append("sonarqube")
+
+        # Use the latest content (could be base, +coverage, +sonar)
+        final_ci = PipelineFile(
+            filename=ci_pipeline.filename,
+            content=ci_content,
+            description=ci_pipeline.description,
         )
-        if ci_entry is None:
-            logger.error("Phase 2 — cannot find CI pipeline to add coverage job!")
-            return {"pipelines": pipelines}
-        updated = generate_coverage_job(analysis, platform, ci_entry["content"])
-        pipelines[ci_idx] = updated.model_dump()
-    elif phase == 3:
-        logger.info("Phase 3 — adding SonarQube job to CI pipeline.")
-        ci_idx, ci_entry = next(
-            ((i, p) for i, p in enumerate(pipelines)
-             if "ci" in p.get("description", "").lower()
-             and "security" not in p.get("description", "").lower()),
-            (None, None),
-        )
-        if ci_entry is None:
-            logger.error("Phase 3 — cannot find CI pipeline to add SonarQube job!")
-            return {"pipelines": pipelines}
-        updated = generate_sonarqube_job(analysis, platform, ci_entry["content"])
-        pipelines[ci_idx] = updated.model_dump()
-    else:
-        logger.warning("Unknown phase %d — nothing to generate.", phase)
+        all_pipelines.append(final_ci.model_dump())
+        enabled.append("ci")
+
+    # ── Security pipeline (standalone) ──────────────────────────────────
+    if config.enable_security:
+        security_pipeline = generate_security(analysis, platform)
+        logger.info("  → Security pipeline generated.")
+        all_pipelines.append(security_pipeline.model_dump())
+        enabled.append("security")
+
+    logger.info(
+        "Generated pipelines: %s (test categories: %s)",
+        enabled,
+        config.test_categories or "all discovered",
+    )
 
     # Save generated YAML to log dir
     rl = _get_logger(state)
     if rl:
-        if new_pipelines:
-            for p in new_pipelines:
-                rl.save_generated_pipeline(phase, p)
-        elif phase in (2, 3):
-            ci_entry = next(
-                (p for p in pipelines
-                 if "ci" in p.get("description", "").lower()
-                 and "security" not in p.get("description", "").lower()),
-                None,
-            )
-            if ci_entry:
-                rl.save_generated_pipeline(phase, ci_entry)
+        for p in all_pipelines:
+            rl.save_generated_pipeline(1, p)
 
-    return {"pipelines": pipelines + new_pipelines}
+    return {"pipelines": all_pipelines}
 
 
 def write_files_node(state: PipelineState) -> dict:
@@ -508,10 +528,11 @@ def fix_pipelines_node(state: PipelineState) -> dict:
         prev = fix_history.get(pipeline_obj.filename, [])
 
         # ── Step 2: Decide action based on classification ───────────────
-        if category == "app_code":
-            # App code issue — skip immediately, no YAML fix will help
-            logger.warning(
-                "Skipping %s — classified as app_code issue. "
+        if category == "test_failure":
+            # Pipeline is working correctly — tests/lint/coverage just reported
+            # failures.  Mark the failing step as non-blocking.
+            logger.info(
+                "Pipeline %s infrastructure is correct — classified as test_failure. "
                 "Adding continue-on-error to the failing step.",
                 pipeline_obj.filename,
             )
@@ -536,8 +557,8 @@ def fix_pipelines_node(state: PipelineState) -> dict:
                 "yaml_before": pipeline_obj.content[:3000],
                 "yaml_after": fixed.content[:3000],
                 "diff_summary": diff_summary,
-                "classification": "app_code",
-                "note": "Skipped — app code issue, added continue-on-error",
+                "classification": "test_failure",
+                "note": "Pipeline OK — test/lint/coverage failure, added continue-on-error",
             })
             # Write the updated YAML
             filepath = Path(state["clone_path"]) / fixed.filename
@@ -674,25 +695,6 @@ def fix_pipelines_node(state: PipelineState) -> dict:
     }
 
 
-def advance_phase_node(state: PipelineState) -> dict:
-    """Move to the next phase and reset per-phase counters."""
-    phase = state.get("current_phase", 1)
-    next_phase = phase + 1
-    logger.info("Advancing to phase %d.", next_phase)
-
-    rl = _get_logger(state)
-    if rl:
-        rl.save_phase_outcome(phase, passed=True, attempts_used=state.get("fix_attempts", 0))
-
-    return {
-        "current_phase": next_phase,
-        "fix_attempts": 0,
-        "all_passed": False,
-        "failed_runs": [],
-        "last_push_had_changes": True,
-    }
-
-
 # ── Conditional edges ───────────────────────────────────────────────────────
 
 
@@ -700,53 +702,38 @@ def after_push(state: PipelineState) -> str:
     """After push_and_pr: skip wait if nothing was pushed."""
     if not state.get("last_push_had_changes", True):
         if state.get("fix_attempts", 0) >= MAX_FIX_ATTEMPTS:
-            return "phase_done_fail"
+            return "give_up"
         return "fix_pipelines"
     return "wait_for_runs"
 
 
 def should_retry(state: PipelineState) -> str:
-    """After wait_for_runs: retry, advance, or give up."""
+    """After wait_for_runs: retry fix, finish, or give up."""
     if state.get("all_passed", False):
-        phase = state.get("current_phase", 1)
-        if phase >= _MAX_PHASE:
-            return "all_done"       # last phase passed — go to cleanup
-        return "phase_done_pass"    # advance to next phase
+        return "all_done"
 
-    # If no phase runs were found AND no failures, the pipeline never triggered —
-    # don't waste attempts retrying, treat as phase failure.
+    # If no runs were found AND no failures, the pipeline never triggered.
     failed_runs = state.get("failed_runs", [])
     if not failed_runs:
-        phase = state.get("current_phase", 1)
         logger.warning(
-            "Phase %d — no workflow runs found for this phase. "
-            "The pipeline likely didn't trigger (workflow_run cascade issue). "
-            "Marking phase as failed.",
-            phase,
+            "No workflow runs found. The pipeline likely didn't trigger. "
+            "Marking as failed.",
         )
         rl = _get_logger(state)
         if rl:
-            rl.save_phase_outcome(phase, passed=False,
+            rl.save_phase_outcome(1, passed=False,
                                   attempts_used=state.get("fix_attempts", 0))
-        return "phase_done_fail"
+        return "give_up"
 
     if state.get("fix_attempts", 0) >= MAX_FIX_ATTEMPTS:
-        phase = state.get("current_phase", 1)
-        skipped = list(range(phase + 1, _MAX_PHASE + 1))
-        if skipped:
-            logger.warning(
-                "Phase %d failed after %d attempts. Skipping downstream phases %s.",
-                phase, MAX_FIX_ATTEMPTS, skipped,
-            )
-        else:
-            logger.warning(
-                "Phase %d (last) failed after %d attempts.", phase, MAX_FIX_ATTEMPTS,
-            )
-        # Log phase failure
+        logger.warning(
+            "Failed after %d fix attempts. Creating PR with current state.",
+            MAX_FIX_ATTEMPTS,
+        )
         rl = _get_logger(state)
         if rl:
-            rl.save_phase_outcome(phase, passed=False, attempts_used=MAX_FIX_ATTEMPTS)
-        return "phase_done_fail"
+            rl.save_phase_outcome(1, passed=False, attempts_used=MAX_FIX_ATTEMPTS)
+        return "give_up"
     return "fix_pipelines"
 
 
@@ -797,7 +784,6 @@ def build_graph() -> StateGraph:
     graph.add_node("push_and_pr", push_and_pr_node)
     graph.add_node("wait_for_runs", wait_for_runs_node)
     graph.add_node("fix_pipelines", fix_pipelines_node)
-    graph.add_node("advance_phase", advance_phase_node)
     graph.add_node("restructure", restructure_node)
     graph.add_node("write_restructured", write_files_node)
     graph.add_node("push_restructured", push_and_pr_node)
@@ -817,24 +803,20 @@ def build_graph() -> StateGraph:
     graph.add_conditional_edges("push_and_pr", after_push, {
         "wait_for_runs": "wait_for_runs",
         "fix_pipelines": "fix_pipelines",
-        "phase_done_fail": "cleanup",
+        "give_up": "cleanup",
     })
 
-    # After wait → retry fix, advance phase, or finish
+    # After wait → retry fix or finish
     graph.add_conditional_edges("wait_for_runs", should_retry, {
         "fix_pipelines": "fix_pipelines",
-        "phase_done_pass": "advance_phase",
-        "phase_done_fail": "cleanup",
+        "give_up": "cleanup",
         "all_done": "restructure",
     })
 
     # Fix loop: fix → write → push → (back to wait/retry via after_push)
     graph.add_edge("fix_pipelines", "write_files")
 
-    # Phase advanced → generate next phase's pipelines
-    graph.add_edge("advance_phase", "generate_phase")
-
-    # After all phases pass → restructure into production files → push → PR
+    # After all pass → restructure into production files → push → PR
     graph.add_edge("restructure", "write_restructured")
     graph.add_edge("write_restructured", "push_restructured")
     graph.add_edge("push_restructured", "create_pr")
@@ -849,14 +831,20 @@ def build_graph() -> StateGraph:
 
 
 def run_pipeline_generator(
-    analysis: RepoAnalysis, run_dir: str = "",
+    analysis: RepoAnalysis,
+    run_dir: str = "",
+    config: PipelineConfig | None = None,
 ) -> PipelineResult:
     """Run the full pipeline generation and return structured output."""
+    if config is None:
+        config = PipelineConfig()
+
     graph = build_graph()
     app = graph.compile()
 
     initial_state: PipelineState = {
         "analysis": analysis.model_dump(),
+        "config": config.model_dump(),
         "platform": "",
         "pipelines": [],
         "clone_path": "",

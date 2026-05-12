@@ -263,9 +263,9 @@ def classify_pipeline_error(
     workflow_name: str,
     error_log: str,
 ) -> str:
-    """Ask the LLM to classify an error as pipeline_config, missing_secret, or app_code.
+    """Ask the LLM to classify an error as pipeline_config, missing_secret, or test_failure.
 
-    Returns one of: 'pipeline_config', 'missing_secret', 'app_code'.
+    Returns one of: 'pipeline_config', 'missing_secret', 'test_failure'.
     Falls back to 'pipeline_config' if the LLM response is unexpected.
     """
     llm = get_llm()
@@ -280,7 +280,7 @@ def classify_pipeline_error(
         {"role": "user", "content": prompt},
     ])
     category = response.content.strip().lower().replace(".", "")
-    valid = {"pipeline_config", "missing_secret", "app_code"}
+    valid = {"pipeline_config", "missing_secret", "test_failure"}
     if category not in valid:
         # If the LLM returned something unexpected, default to pipeline_config
         return "pipeline_config"
@@ -348,19 +348,23 @@ def fix_pipeline(
     else:
         ctx["applied_fixes_section"] = ""
 
-    # If classified as app_code or exhausted missing_secret attempts, instruct to skip
+    # If classified as test_failure or exhausted missing_secret attempts, instruct to skip
     if use_continue_on_error:
         ctx["continue_on_error_section"] = (
-            "\n### IMPORTANT — This failure CANNOT be fixed by changing pipeline YAML:\n"
-            "The error is caused by either:\n"
-            "  (a) An APPLICATION CODE bug (failing test, import error, etc.), OR\n"
-            "  (b) A missing secret/env variable that is not configured in GitHub Actions.\n\n"
+            "\n### IMPORTANT — This failure is NOT a pipeline infrastructure issue:\n"
+            "The pipeline step EXECUTED correctly, but reported failures in the application.\n"
+            "This could be:\n"
+            "  (a) Tests ran but some assertions failed (app code bug, NOT pipeline bug)\n"
+            "  (b) Coverage ran but is below the threshold (app needs more tests)\n"
+            "  (c) Linter ran but found violations in the app code\n"
+            "  (d) A missing secret/env variable not configured in GitHub Actions\n\n"
             "ACTION REQUIRED:\n"
             "1. Add `continue-on-error: true` to the specific step that is failing.\n"
-            "2. Add a YAML comment above that step explaining WHY it is skipped. Examples:\n"
-            "   # SKIPPED: App code issue — test assertion fails due to application bug\n"
-            "   # SKIPPED: Missing secret — required token/credential not configured\n"
-            "   # SKIPPED: Missing env var — required environment variable not available in CI\n"
+            "2. Add a YAML comment above that step explaining WHY it is non-blocking. Examples:\n"
+            "   # NON-BLOCKING: Tests execute but some assertions fail — dev team to fix\n"
+            "   # NON-BLOCKING: Coverage below threshold — dev team to improve coverage\n"
+            "   # NON-BLOCKING: Lint violations in app code — dev team to address\n"
+            "   # NON-BLOCKING: Missing secret — required credential not configured\n"
             "3. Do NOT remove the step — keep it visible but non-blocking.\n"
             "4. Do NOT change any other part of the pipeline — only add continue-on-error\n"
             "   and the comment to the failing step(s).\n"

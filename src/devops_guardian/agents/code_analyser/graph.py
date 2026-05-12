@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 class AnalyserState(TypedDict):
     repo_url: str
+    branch: str  # branch to clone (empty = DEFAULT_BRANCH env var)
     clone_path: str
     file_paths: list[str]
     run_dir: str  # path to the run output directory (empty = no logging)
@@ -36,7 +37,8 @@ class AnalyserState(TypedDict):
 
 
 def clone_node(state: AnalyserState) -> dict:
-    clone_path = clone_repo(state["repo_url"])
+    branch = state.get("branch") or None
+    clone_path = clone_repo(state["repo_url"], branch=branch)
     file_paths = build_file_tree(clone_path)
     return {"clone_path": clone_path, "file_paths": file_paths}
 
@@ -105,6 +107,7 @@ def scan_node(state: AnalyserState) -> dict:
 
     analysis = RepoAnalysis(
         repo_url=state["repo_url"],
+        branch=state.get("branch", ""),
         languages=languages,
         frameworks=frameworks,
         architecture=architecture,
@@ -147,13 +150,14 @@ def build_graph() -> StateGraph:
     return graph
 
 
-def run_analysis(repo_url: str, run_dir: str = "") -> RepoAnalysis:
+def run_analysis(repo_url: str, run_dir: str = "", branch: str = "") -> RepoAnalysis:
     """Run the full analysis pipeline and return structured output."""
     graph = build_graph()
     app = graph.compile()
 
     final_state = app.invoke({
         "repo_url": repo_url,
+        "branch": branch,
         "clone_path": "",
         "file_paths": [],
         "run_dir": run_dir,

@@ -263,6 +263,25 @@ def detect_tests(repo_root: str, file_paths: list[str]) -> TestInfo:
                 configs = _detect_framework_configs(file_paths, name)
                 frameworks[name] = TestFrameworkInfo(name=name, category=cat, config_files=configs)
 
+    # ── Infer Django test framework from test files ──────────────────────
+    # Django bundles unittest via django.test — no extra dependency needed.
+    # If Django is installed and we find tests.py files, register it.
+    if "unittest" not in frameworks and "pytest" not in frameworks:
+        has_django = any(
+            "django" in (root / rf).read_text(errors="ignore").lower()
+            for rf in py_dep_files
+            if (root / rf).exists()
+        )
+        has_py_test_files = any(
+            Path(fp).name == "tests.py" or Path(fp).name.startswith("test_")
+            for fp in file_paths
+            if fp.endswith(".py")
+        )
+        if has_django and has_py_test_files:
+            frameworks["Django TestCase"] = TestFrameworkInfo(
+                name="Django TestCase", category="unit", config_files=[],
+            )
+
     # ── Detect from Java build files ─────────────────────────────────────
     for fname in ["pom.xml", "build.gradle", "build.gradle.kts"]:
         for fp in _find_files(file_paths, fname):

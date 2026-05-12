@@ -1,7 +1,11 @@
 """LLM prompts used by the pipeline-generator agent."""
 
-PIPELINE_SYSTEM_PROMPT = """You are a senior DevOps engineer. You generate production-ready CI/CD pipeline \
-configuration files. Output ONLY valid YAML — no markdown fences, no explanations, no extra text. \
+PIPELINE_SYSTEM_PROMPT = """You are a senior DevOps engineer setting up CI/CD pipelines for a development team. \
+Your goal is to create pipeline INFRASTRUCTURE that works correctly — ensuring that tools \
+(linters, test runners, coverage collectors, scanners) can EXECUTE. Whether test assertions \
+pass or code coverage meets a threshold is the DEVELOPMENT TEAM's responsibility, not yours.
+
+Output ONLY valid YAML — no markdown fences, no explanations, no extra text. \
 The YAML must be syntactically correct and follow the exact schema of the target CI/CD platform.
 
 CRITICAL RULES:
@@ -276,14 +280,36 @@ missing API keys for external services that require real authentication. \
 NOTE: App config values needed only for tests/builds (e.g. SECRET_KEY, DATABASE_URL, API_BASE_URL) \
 CAN be set as env vars directly in the pipeline YAML with dummy/CI values — those are pipeline_config.
 
-- **app_code** — The failure is caused by a bug in the APPLICATION source code that absolutely \
-cannot be fixed by changing pipeline YAML. This is ONLY for:
-  * A unit test assertion that fails due to application logic (e.g. expected value != actual value)
-  * A runtime error in app code during test execution (e.g. null pointer, type error in business logic)
-  * NEVER classify linting errors, missing packages, import/require errors, or build tool issues \
-as app_code — those are pipeline_config because the pipeline can install packages or adjust tool settings
+- **test_failure** — The pipeline infrastructure is WORKING CORRECTLY, and the tool EXECUTED \
+and PRODUCED OUTPUT, but the results show failures in the application code or quality metrics. \
+This is ONLY when the tool successfully started, discovered tests/files, and ran to completion \
+(even if some checks failed). This includes:
+  * Test runner executed and reported: "5 passed, 3 failed" — the runner WORKED, some tests failed
+  * Coverage tool ran and reported: "Coverage: 42%" — the tool WORKED, coverage is just low
+  * Linter ran and reported: "Found 15 errors in 4 files" — the linter WORKED, app code has issues
+  * E2E tests ran but some assertions failed — the framework WORKED, app has bugs
 
-Respond with ONLY one of: pipeline_config, missing_secret, app_code
+  HOW TO TELL THE DIFFERENCE (pipeline_config vs test_failure):
+  - "pytest: command not found" → pipeline_config (tool didn't run)
+  - "3 failed, 12 passed, 1 error" → test_failure (pytest ran and found failures)
+  - "ModuleNotFoundError: No module named 'pytest'" → pipeline_config (tool not installed)
+  - "FAILED test_auth.py::test_login - AssertionError" → test_failure (test ran, assertion failed)
+  - "Error: Cannot find module 'jest'" → pipeline_config (tool not installed)
+  - "Tests: 5 failed, 20 passed" → test_failure (jest ran, some tests failed)
+  - "flake8: No such file or directory" → pipeline_config (wrong path)
+  - "flake8 found 50 E501 errors" → test_failure (flake8 ran, app code has long lines)
+  - "ImportError: No module named 'bleach'" → pipeline_config (missing pip install)
+  - "ImportError: cannot import name 'foo' from 'myapp.models'" → test_failure (app code bug)
+  - "coverage: command not found" → pipeline_config (tool not installed)
+  - "FAIL! Coverage below 80% threshold" → test_failure (coverage ran, threshold not met)
+
+  RULE: If the error log shows the tool NEVER STARTED or CRASHED before producing any results, \
+it is pipeline_config. If the log shows the tool DID RUN and REPORTED results (pass/fail counts, \
+coverage percentages, lint violation lists), it is test_failure.
+  * NEVER classify missing packages, import errors for uninstalled modules, or build tool \
+failures as test_failure — those are pipeline_config.
+
+Respond with ONLY one of: pipeline_config, missing_secret, test_failure
 """
 
 FIX_PIPELINE_PROMPT = """A CI/CD pipeline you previously generated is FAILING on {platform}.

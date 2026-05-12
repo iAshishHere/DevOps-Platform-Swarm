@@ -10,6 +10,7 @@ from rich.syntax import Syntax
 from devops_guardian.agents.code_analyser.graph import run_analysis
 from devops_guardian.agents.pipeline_generator.graph import run_pipeline_generator
 from devops_guardian.models.analysis import RepoAnalysis
+from devops_guardian.models.pipeline import PipelineConfig
 
 app = typer.Typer(name="devops-guardian", help="Multi-agent DevOps analysis platform.")
 console = Console()
@@ -39,13 +40,14 @@ def _get_run_dir() -> Path:
 @app.command()
 def analyse(
     repo_url: str = typer.Argument(..., help="GitHub repository URL to analyse."),
+    branch: str = typer.Option("", "--branch", "-b", help="Branch to clone. Defaults to DEFAULT_BRANCH env var."),
 ) -> None:
     """Run the Code Analyser agent on a GitHub repository."""
     console.print(f"\n[bold]Analysing:[/bold] {repo_url}\n")
 
     run_dir = _get_run_dir()
     with console.status("[bold green]Cloning and scanning..."):
-        result = run_analysis(repo_url, run_dir=str(run_dir))
+        result = run_analysis(repo_url, run_dir=str(run_dir), branch=branch)
 
     out_path = run_dir / "agent1-code-analyser.json"
     data = result.model_dump()
@@ -62,8 +64,21 @@ def analyse(
 def generate_pipelines(
     repo_url: str = typer.Argument(None, help="GitHub repository URL (not needed if --analysis-file is given)."),
     analysis_file: str = typer.Option(None, "--analysis-file", "-a", help="Path to a saved Agent 1 JSON output file. Skips re-running Agent 1."),
+    no_ci: bool = typer.Option(False, "--no-ci", help="Skip CI pipeline generation."),
+    no_coverage: bool = typer.Option(False, "--no-coverage", help="Skip coverage job generation."),
+    no_sonarqube: bool = typer.Option(False, "--no-sonarqube", help="Skip SonarQube job generation."),
+    no_security: bool = typer.Option(False, "--no-security", help="Skip security pipeline generation."),
+    test_categories: list[str] = typer.Option([], "--test-category", "-t", help="Test categories to include (e.g. unit, e2e). Can be repeated. Empty = all discovered."),
 ) -> None:
     """Run Agent 2 (generate CI/CD pipelines). Optionally skip Agent 1 with --analysis-file."""
+    config = PipelineConfig(
+        enable_ci=not no_ci,
+        enable_coverage=not no_coverage,
+        enable_sonarqube=not no_sonarqube,
+        enable_security=not no_security,
+        test_categories=test_categories,
+    )
+
     if analysis_file:
         path = Path(analysis_file)
         if not path.exists():
@@ -86,7 +101,7 @@ def generate_pipelines(
         raise typer.Exit(code=1)
 
     with console.status("[bold green]Generating pipelines..."):
-        result = run_pipeline_generator(analysis, run_dir=str(run_dir))
+        result = run_pipeline_generator(analysis, run_dir=str(run_dir), config=config)
 
     a2_path = run_dir / "agent2-pipeline-generator.json"
     out_json = json.dumps(result.model_dump(), indent=2)
