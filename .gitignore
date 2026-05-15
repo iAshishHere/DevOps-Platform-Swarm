@@ -6,3 +6,5 @@ dist/
 *.egg-info/
 tmp_repos/
 outputs/
+.jobs/
+DevOps-Platform-Swarm-UI/

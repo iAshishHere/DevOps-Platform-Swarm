@@ -73,13 +73,10 @@ class RunLogger:
         app_logger.addHandler(self._file_handler)
         if app_logger.level == logging.NOTSET or app_logger.level > logging.DEBUG:
             app_logger.setLevel(logging.DEBUG)
-        # Also capture warnings/errors from libraries via root logger
-        logging.getLogger().addHandler(self._file_handler)
 
     def detach(self) -> None:
         """Remove the file handler from all loggers it was attached to."""
         logging.getLogger("devops_guardian").removeHandler(self._file_handler)
-        logging.getLogger().removeHandler(self._file_handler)
         self._file_handler.flush()
 
     # ── generic writers ──────────────────────────────────────────────────

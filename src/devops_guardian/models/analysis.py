@@ -130,6 +130,35 @@ class DeploymentInfo(BaseModel):
     ] = "unknown"
 
 
+class GitHubFeatures(BaseModel):
+    """GitHub repository features detected via the API."""
+
+    code_scanning_enabled: bool = False
+    dependabot_alerts_enabled: bool = False
+    secret_scanning_enabled: bool = False
+    secret_scanning_push_protection: bool = False
+    is_private: bool = False
+    default_branch: str = "main"
+    actions_secrets: list[str] = []
+    actions_variables: list[str] = []  # repo-level non-secret variables
+    environment_vars: dict[str, list[str]] = {}  # {env_name: [var_names]}
+
+
+class DetectedEnvVar(BaseModel):
+    """An environment variable reference found in source code."""
+
+    name: str
+    files: list[str] = []
+
+
+class DetectedEnvVars(BaseModel):
+    """Environment variables detected from the repository source code."""
+
+    required: list[DetectedEnvVar] = []
+    optional: list[DetectedEnvVar] = []
+    total_env_var_count: int = 0
+
+
 class RepoAnalysis(BaseModel):
     """Output schema for Agent 1: Code Analyser."""
 
@@ -148,3 +177,5 @@ class RepoAnalysis(BaseModel):
     deployment: DeploymentInfo = DeploymentInfo()
     cloud_providers: list[str] = []
     cicd: list[CICDInfo] = []
+    github_features: GitHubFeatures = GitHubFeatures()
+    env_vars: DetectedEnvVars = DetectedEnvVars()

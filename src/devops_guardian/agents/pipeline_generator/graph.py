@@ -20,7 +20,7 @@ import json as _json
 import logging
 import os
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Callable, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -28,9 +28,22 @@ from devops_guardian.agents.pipeline_generator.generators.pipelines import (
     classify_pipeline_error,
     fix_pipeline,
     generate_ci,
+    generate_container_scanning,
     generate_coverage_job,
+    generate_e2e_tests,
+    generate_formatting,
+    generate_iac_security,
+    generate_iac_validation,
+    generate_integration_tests,
+    generate_k8s_checks,
+    generate_license_compliance,
+    generate_linting,
+    generate_performance_tests,
+    generate_sast,
+    generate_secret_scanning,
     generate_security,
     generate_sonarqube_job,
+    generate_vulnerability_scanning,
     restructure_pipelines,
 )
 from devops_guardian.agents.pipeline_generator.generators.platform import resolve_platform
@@ -57,7 +70,14 @@ _MAX_PHASE = 1  # Single phase — everything generated at once
 
 # Phase → keywords used to identify workflow runs that belong to that phase
 _PHASE_KEYWORDS: dict[int, set[str]] = {
-    1: {"ci", "security"},
+    1: {
+        "ci", "security", "build", "test", "pipeline",
+        "formatting", "format", "lint", "linting",
+        "secret", "vulnerability", "license", "compliance",
+        "container", "scanning", "iac", "k8s", "kubernetes",
+        "sast", "e2e", "integration", "performance",
+        "coverage", "sonarqube", "sonar",
+    },
 }
 
 
@@ -72,12 +92,21 @@ class PipelineState(TypedDict):
     fix_attempts: int            # per-phase counter — reset on phase advance
     all_passed: bool             # True when current phase's runs all passed
     failed_runs: list[dict[str, Any]]
+    passed_files: list[str]      # filenames of pipelines that already passed
     fix_history: dict[str, list[dict[str, str]]]
     last_push_had_changes: bool
     current_phase: int           # 1, 2, 3
     phase_failed: bool           # True when a phase exhausted MAX_FIX_ATTEMPTS
     run_dir: str                 # path to the run output directory (empty = no logging)
+    progress_callback: Callable[..., None] | None  # (step, message, **detail)
     result: dict[str, Any]
+
+
+def _emit(state: PipelineState, step: str, message: str, **detail: Any) -> None:
+    """Send a progress event if a callback is registered."""
+    cb = state.get("progress_callback")
+    if cb:
+        cb(step, message, **detail)
 
 
 def _get_logger(state: PipelineState) -> RunLogger | None:
@@ -115,6 +144,17 @@ def _compute_diff_summary(before: str, after: str, max_lines: int = 50) -> str:
 
 
 _SECRET_ATTEMPT_THRESHOLD = 2  # skip after this many attempts for missing_secret
+_TEST_FAILURE_COE_THRESHOLD = 2  # require N consecutive test_failure classifications before COE
+
+# Pipelines where test_failure → continue-on-error is valid.
+# Security/infra pipelines failing ≠ test_failure; they need real fixes.
+_TEST_FAILURE_COE_FILES = {"ci", "coverage", "sonarqube", "linting", "formatting"}
+
+
+def _allows_continue_on_error(filename: str) -> bool:
+    """Return True if this pipeline file should use continue-on-error for test_failure."""
+    stem = Path(filename).stem.lower()
+    return any(kw in stem for kw in _TEST_FAILURE_COE_FILES)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -137,9 +177,25 @@ def _match_pipeline_to_run(
     """Best-effort match a GitHub Actions workflow name to a pipeline file."""
     wf_lower = workflow_name.lower()
 
+    # Order matters — more specific groups MUST come before generic ones.
+    # Keywords are matched as substrings, so avoid short tokens that appear
+    # inside common words (e.g. "sca" matches "scanning").
     keyword_groups = [
         ["sonarqube", "sonar"],
         ["coverage"],
+        ["formatting", "format check"],
+        ["linting", "lint", "static analysis"],
+        ["secret scanning", "secret-scanning", "gitleaks", "trufflehog"],
+        ["vulnerability", "dependency scan", "pip-audit", "npm audit", "trivy fs"],
+        ["license", "compliance"],
+        ["container scan", "container-scan", "image scan", "dockle"],
+        ["iac validation", "iac-validation", "terraform validate", "tflint", "bicep build"],
+        ["iac security", "iac-security", "checkov", "tfsec", "kics"],
+        ["k8s", "kubernetes", "helm lint", "kube-score", "kube-linter"],
+        ["sast", "bandit", "semgrep", "codeql", "gosec", "spotbugs"],
+        ["e2e", "end-to-end", "cypress", "playwright"],
+        ["integration test", "integration-test"],
+        ["performance", "load test"],
         ["security"],
         ["ci"],
     ]
@@ -150,12 +206,26 @@ def _match_pipeline_to_run(
                 fname_lower = filename.lower()
                 desc_lower = pdata.get("description", "").lower()
                 if any(kw in fname_lower or kw in desc_lower for kw in kws):
+                    logger.debug(
+                        "Matched workflow '%s' → %s (kw group %s)",
+                        workflow_name, filename, kws,
+                    )
                     return pdata
 
+    # Fallback: stem matching
     for filename, pdata in pipelines_by_file.items():
         stem = Path(filename).stem.lower()
         if stem in wf_lower or wf_lower in stem:
+            logger.debug(
+                "Matched workflow '%s' → %s (stem fallback)",
+                workflow_name, filename,
+            )
             return pdata
+
+    logger.debug(
+        "No match for workflow '%s' in files: %s",
+        workflow_name, list(pipelines_by_file.keys()),
+    )
     return None
 
 
@@ -186,10 +256,12 @@ def _build_pr_body(platform: str, pipelines: list[dict]) -> str:
 def clone_and_branch_node(state: PipelineState) -> dict:
     """Clone the repo and create a feature branch."""
     analysis = RepoAnalysis(**state["analysis"])
+    _emit(state, "clone", f"Cloning {analysis.repo_url}…")
     clone_path = clone_repo(analysis.repo_url)
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
     branch_name = f"devops-guardian/pipelines-{ts}"
     create_branch(clone_path, branch_name)
+    _emit(state, "clone", f"Repository cloned, branch {branch_name} created.")
 
     rl = _get_logger(state)
     if rl:
@@ -203,6 +275,7 @@ def resolve_platform_node(state: PipelineState) -> dict:
     """Determine which CI/CD platform to target."""
     analysis = RepoAnalysis(**state["analysis"])
     platform = resolve_platform(analysis)
+    _emit(state, "platform", f"Resolved CI/CD platform: {platform}")
 
     rl = _get_logger(state)
     if rl:
@@ -219,21 +292,51 @@ def _filter_analysis_by_config(
     analysis: RepoAnalysis, config: PipelineConfig,
 ) -> RepoAnalysis:
     """Return a copy of the analysis with test frameworks filtered by
-    the user-selected categories.  If ``config.test_categories`` is empty,
-    all discovered frameworks are kept (backward-compatible).
+    the user-selected pipelines and test categories.
+
+    When ``selected_pipelines`` is non-empty, only test framework categories
+    whose corresponding pipeline key is selected are kept.  For example, if
+    the user selected only ``["unit_tests", "secret_scanning"]``, e2e /
+    integration / performance frameworks are stripped so the LLM won't
+    generate jobs for them inside the CI pipeline.
+
+    ``test_categories`` offers an additional, finer-grained filter.
     """
-    if not config.test_categories:
-        return analysis
+    frameworks = list(analysis.tests.frameworks)
 
-    selected = set(config.test_categories)
-    filtered_frameworks = [
-        fw for fw in analysis.tests.frameworks if fw.category in selected
-    ]
+    # ── Filter by selected_pipelines ────────────────────────────────
+    # Map pipeline keys → test framework categories
+    _PIPELINE_TO_CATEGORY = {
+        "unit_tests": "unit",
+        "e2e_tests": "e2e",
+        "integration_tests": "integration",
+        "performance_tests": "performance",
+    }
 
-    # Shallow copy with only the filtered test frameworks
+    if config.selected_pipelines:
+        allowed_categories: set[str] = set()
+        for key, cat in _PIPELINE_TO_CATEGORY.items():
+            if key in config.selected_pipelines:
+                allowed_categories.add(cat)
+        # Also keep categories that have no matching pipeline key (e.g. "linting")
+        # so lint frameworks aren't accidentally dropped.
+        known_cats = set(_PIPELINE_TO_CATEGORY.values())
+        frameworks = [
+            fw for fw in frameworks
+            if fw.category in allowed_categories or fw.category not in known_cats
+        ]
+
+    # ── Filter by test_categories (finer-grained) ──────────────────
+    if config.test_categories:
+        selected = set(config.test_categories)
+        frameworks = [fw for fw in frameworks if fw.category in selected]
+
+    if frameworks == list(analysis.tests.frameworks):
+        return analysis  # nothing changed
+
     return analysis.model_copy(
         update={"tests": analysis.tests.model_copy(
-            update={"frameworks": filtered_frameworks},
+            update={"frameworks": frameworks},
         )},
     )
 
@@ -241,8 +344,8 @@ def _filter_analysis_by_config(
 def generate_phase_node(state: PipelineState) -> dict:
     """Generate pipelines according to the user-selected config.
 
-    Respects ``PipelineConfig`` flags — only generates pipeline types
-    the user opted into.  Test frameworks are filtered to match
+    Respects ``PipelineConfig.selected_pipelines`` — only generates pipeline
+    types the user opted into.  Test frameworks are filtered to match
     the selected categories before being sent to the LLM.
     """
     config = PipelineConfig(**state.get("config", {}))
@@ -253,23 +356,40 @@ def generate_phase_node(state: PipelineState) -> dict:
     all_pipelines: list[dict[str, Any]] = []
     enabled: list[str] = []
 
+    _emit(state, "generate", "Generating pipelines…")
+
+    # Helper to find tools for a pipeline key from the available options
+    # (tools were set in available_options_from_analysis).  We reconstruct
+    # them here from the analysis so generate_phase_node is self-contained.
+    def _tools_for(key: str) -> list[str]:
+        """Return the tool names associated with a pipeline option key."""
+        from devops_guardian.models.pipeline import available_options_from_analysis as _derive
+        opts = _derive(analysis_raw)
+        for opt in opts.pipeline_options:
+            if opt.key == key:
+                return opt.tools
+        return []
+
     # ── CI pipeline (test/build job) ────────────────────────────────────
-    if config.enable_ci:
+    if config.has("unit_tests"):
         ci_pipeline = generate_ci(analysis, platform)
         logger.info("  → Base CI pipeline generated.")
+        _emit(state, "generate", "CI pipeline generated (test/build job).")
         ci_content = ci_pipeline.content
 
         # ── Coverage job (added into CI file) ───────────────────────────
-        if config.enable_coverage:
+        if config.has("coverage"):
             ci_with_coverage = generate_coverage_job(analysis, platform, ci_content)
             logger.info("  → Coverage job added to CI pipeline.")
+            _emit(state, "generate", "Coverage job added to CI pipeline.")
             ci_content = ci_with_coverage.content
             enabled.append("coverage")
 
         # ── SonarQube job (added into CI file, depends on coverage) ─────
-        if config.enable_sonarqube:
+        if config.has("sonarqube"):
             ci_combined = generate_sonarqube_job(analysis, platform, ci_content)
             logger.info("  → SonarQube job added to CI pipeline.")
+            _emit(state, "generate", "SonarQube job added to CI pipeline.")
             ci_content = ci_combined.content
             enabled.append("sonarqube")
 
@@ -280,14 +400,47 @@ def generate_phase_node(state: PipelineState) -> dict:
             description=ci_pipeline.description,
         )
         all_pipelines.append(final_ci.model_dump())
-        enabled.append("ci")
+        enabled.append("unit_tests")
 
-    # ── Security pipeline (standalone) ──────────────────────────────────
-    if config.enable_security:
-        security_pipeline = generate_security(analysis, platform)
-        logger.info("  → Security pipeline generated.")
-        all_pipelines.append(security_pipeline.model_dump())
-        enabled.append("security")
+    # ── Standalone pipelines ────────────────────────────────────────────
+
+    _STANDALONE_GENERATORS = {
+        "formatting": lambda: generate_formatting(analysis, platform, _tools_for("formatting")),
+        "linting": lambda: generate_linting(analysis, platform, _tools_for("linting")),
+        "secret_scanning": lambda: generate_secret_scanning(analysis, platform),
+        "vulnerability_scanning": lambda: generate_vulnerability_scanning(analysis, platform, _tools_for("vulnerability_scanning")),
+        "license_compliance": lambda: generate_license_compliance(analysis, platform),
+        "container_scanning": lambda: generate_container_scanning(analysis, platform),
+        "iac_validation": lambda: generate_iac_validation(analysis, platform),
+        "iac_security": lambda: generate_iac_security(analysis, platform),
+        "k8s_checks": lambda: generate_k8s_checks(analysis, platform),
+        "sast": lambda: generate_sast(analysis, platform, _tools_for("sast")),
+        "e2e_tests": lambda: generate_e2e_tests(analysis, platform, _tools_for("e2e_tests")),
+        "integration_tests": lambda: generate_integration_tests(analysis, platform, _tools_for("integration_tests")),
+        "performance_tests": lambda: generate_performance_tests(analysis, platform, _tools_for("performance_tests")),
+        # Legacy "security" key — the combined security pipeline
+        "security": lambda: generate_security(analysis, platform),
+    }
+
+    for key, gen_fn in _STANDALONE_GENERATORS.items():
+        if not config.has(key):
+            continue
+        # Skip "security" if user chose granular security pipelines instead
+        if key == "security" and any(
+            config.has(k) for k in ["sast", "secret_scanning", "vulnerability_scanning",
+                                     "container_scanning", "license_compliance"]
+        ):
+            continue
+
+        try:
+            pipeline = gen_fn()
+            all_pipelines.append(pipeline.model_dump())
+            enabled.append(key)
+            _emit(state, "generate", f"{pipeline.description} generated.")
+            logger.info("  → %s pipeline generated.", key)
+        except Exception as e:
+            logger.error("Failed to generate %s pipeline: %s", key, e)
+            _emit(state, "generate", f"Failed to generate {key}: {e}")
 
     logger.info(
         "Generated pipelines: %s (test categories: %s)",
@@ -325,23 +478,26 @@ def push_and_pr_node(state: PipelineState) -> dict:
 
     if attempt == 0:
         commit_msg = f"feat: add phase {phase} pipelines via DevOps Guardian\n\n{phase_names}"
+        _emit(state, "push", "Pushing generated pipelines to branch…")
     else:
         commit_msg = f"fix: auto-fix phase {phase} pipelines (attempt {attempt})\n\n{phase_names}"
+        _emit(state, "push", f"Pushing fix attempt {attempt}…")
 
     pushed = commit_and_push(state["clone_path"], branch_name, commit_msg)
-    if not pushed and attempt > 0:
-        logger.warning(
-            "Nothing changed after fix attempt %d (phase %d) — "
-            "LLM produced identical YAML. Skipping wait cycle.",
-            attempt, phase,
-        )
-        return {"all_passed": False, "last_push_had_changes": False}
+    if not pushed:
+        if attempt > 0:
+            logger.info(
+                "No file changes to push (phase %d, attempt %d).",
+                phase, attempt,
+            )
+        return {"last_push_had_changes": False}
 
     return {"last_push_had_changes": True}
 
 
 def create_pr_node(state: PipelineState) -> dict:
     """Create a pull request after all phases have completed."""
+    _emit(state, "pr", "Creating pull request…")
     analysis = RepoAnalysis(**state["analysis"])
     pr_body = _build_pr_body(state["platform"], state["pipelines"])
     pr_url = create_pull_request(
@@ -351,6 +507,7 @@ def create_pr_node(state: PipelineState) -> dict:
         body=pr_body,
     )
     logger.info("Pull request created: %s", pr_url)
+    _emit(state, "pr", f"Pull request created: {pr_url}", url=pr_url)
 
     rl = _get_logger(state)
     if rl:
@@ -365,6 +522,9 @@ def restructure_node(state: PipelineState) -> dict:
     After all phases pass, the CI file contains build+test, coverage, and
     sonarqube as jobs.  This node restructures them into independent files
     with proper workflow_run triggers for production use.
+
+    Validates that every job in the combined pipeline appears in the output.
+    Retries once on validation failure, then falls back to the combined file.
     """
     analysis = RepoAnalysis(**state["analysis"])
     platform = state["platform"]
@@ -382,14 +542,27 @@ def restructure_node(state: PipelineState) -> dict:
         return {}
 
     logger.info("Restructuring combined CI pipeline into separate production files…")
+    _emit(state, "restructure", "Restructuring pipelines into separate production files…")
     rl = _get_logger(state)
 
-    try:
-        split_files = restructure_pipelines(analysis, platform, ci_entry["content"])
-    except Exception as e:
-        logger.error("Restructure failed: %s — keeping combined file.", e)
-        if rl:
-            logger.info("Restructure error detail: %s", str(e))
+    max_restructure_attempts = 2
+    split_files = None
+
+    for attempt in range(1, max_restructure_attempts + 1):
+        try:
+            split_files = restructure_pipelines(analysis, platform, ci_entry["content"])
+            break  # Validation passed inside restructure_pipelines
+        except Exception as e:
+            logger.warning(
+                "Restructure attempt %d/%d failed: %s",
+                attempt, max_restructure_attempts, e,
+            )
+            if attempt >= max_restructure_attempts:
+                logger.error("Restructure failed after %d attempts — keeping combined file.", attempt)
+                _emit(state, "restructure", "Restructure validation failed — keeping combined pipeline.")
+                return {}
+
+    if split_files is None:
         return {}
 
     # Replace the combined CI entry with the split files, keep security untouched
@@ -417,21 +590,21 @@ def wait_for_runs_node(state: PipelineState) -> dict:
     """Wait for the current phase's workflows to complete on the branch."""
     analysis = RepoAnalysis(**state["analysis"])
     phase = state.get("current_phase", 1)
-    phase_pipelines = _pipelines_for_phase(state["pipelines"], phase)
 
+    _emit(state, "waiting", "Waiting for workflow runs to complete…")
     logger.info(
         "Phase %d — waiting for workflow(s) on branch %s …",
         phase, state["branch_name"],
     )
 
-    # All pipelines are push-triggered (phases 2/3 modify the CI file, no cascade)
+    # All pipelines are push-triggered
     total_pushed = len(set(p["filename"] for p in state["pipelines"]))
 
     runs = wait_for_workflow_runs(
         analysis.repo_url,
         state["branch_name"],
         expected_count=total_pushed,
-        cascade_workflow_names=None,  # No cascade needed — all push-triggered
+        cascade_workflow_names=None,
     )
 
     # Only judge the CURRENT phase's workflows — ignore other re-runs
@@ -443,24 +616,47 @@ def wait_for_runs_node(state: PipelineState) -> dict:
     other_runs = [r for r in runs if r not in phase_runs]
 
     failed = [r for r in phase_runs if r["conclusion"] != "success"]
+    passed = [r for r in phase_runs if r["conclusion"] == "success"]
     all_passed = len(failed) == 0 and len(phase_runs) > 0
 
+    # ── Track which pipeline *files* have already passed ────────────
+    pipelines_by_file = {p["filename"]: p for p in state["pipelines"]}
+    already_passed = list(state.get("passed_files", []))
+    for r in passed:
+        matched = _match_pipeline_to_run(r["name"], pipelines_by_file)
+        if matched and matched["filename"] not in already_passed:
+            already_passed.append(matched["filename"])
+
+    # Emit individual per-run results so the UI can update cards granularly
+    for r in passed:
+        _emit(state, "run_result", f"{r['name']}", workflow=r["name"], conclusion="success")
+    for r in failed:
+        _emit(state, "run_result", f"{r['name']}", workflow=r["name"], conclusion=r.get("conclusion", "failure"))
+
     if all_passed:
+        _emit(state, "waiting", f"All {len(phase_runs)} workflow(s) passed!", passed=True)
         logger.info(
             "Phase %d — all %d workflow(s) passed. %s",
             phase, len(phase_runs),
             "(+ %d other re-runs)" % len(other_runs) if other_runs else "",
         )
     elif not phase_runs:
+        _emit(state, "waiting", "No matching workflow runs found.", passed=False)
         logger.warning(
             "Phase %d — no matching workflow runs found (expected keywords: %s). "
             "Saw %d total run(s): %s",
             phase, phase_keywords, len(runs), [r["name"] for r in runs],
         )
     else:
+        failed_names = [r["name"] for r in failed]
+        passed_names = [r["name"] for r in passed]
+        msg_parts = [f"{len(failed)}/{len(phase_runs)} workflow(s) failed: {', '.join(failed_names)}"]
+        if passed_names:
+            msg_parts.append(f"Passed: {', '.join(passed_names)}")
+        _emit(state, "waiting", " | ".join(msg_parts), passed=False)
         logger.warning(
-            "Phase %d — %d/%d workflow(s) failed: %s",
-            phase, len(failed), len(phase_runs), [r["name"] for r in failed],
+            "Phase %d — %d/%d workflow(s) failed: %s | Passed: %s",
+            phase, len(failed), len(phase_runs), failed_names, passed_names,
         )
 
     # Log run results
@@ -468,7 +664,11 @@ def wait_for_runs_node(state: PipelineState) -> dict:
     if rl:
         rl.save_run_results(phase, runs)
 
-    return {"all_passed": all_passed, "failed_runs": failed}
+    return {
+        "all_passed": all_passed,
+        "failed_runs": failed,
+        "passed_files": already_passed,
+    }
 
 
 def fix_pipelines_node(state: PipelineState) -> dict:
@@ -486,6 +686,11 @@ def fix_pipelines_node(state: PipelineState) -> dict:
         logger.info("Phase %d — no failed runs to fix.", phase)
         return {"fix_attempts": attempt}
 
+    _emit(
+        state, "fix",
+        f"Fixing {len(failed_runs)} failed pipeline(s) (attempt {attempt}/{MAX_FIX_ATTEMPTS})…",
+        attempt=attempt, max_attempts=MAX_FIX_ATTEMPTS,
+    )
     logger.info(
         "Phase %d — fixing %d failed pipeline(s) (attempt %d) …",
         phase, len(failed_runs), attempt,
@@ -519,6 +724,17 @@ def fix_pipelines_node(state: PipelineState) -> dict:
             continue
 
         pipeline_obj = PipelineFile(**matched_pipeline)
+
+        # ── Skip pipelines that already passed in a prior run ───────────
+        if pipeline_obj.filename in state.get("passed_files", []):
+            logger.info(
+                "Skipping %s — already passed in a previous run.",
+                pipeline_obj.filename,
+            )
+            if rl:
+                rl.save_fix_skip(phase, attempt, run_info["name"], "already passed")
+            continue
+
         logger.info("Sending %s to LLM for fix (attempt %d) …", pipeline_obj.filename, attempt)
 
         # ── Step 1: Classify the error ──────────────────────────────────
@@ -527,19 +743,50 @@ def fix_pipelines_node(state: PipelineState) -> dict:
 
         prev = fix_history.get(pipeline_obj.filename, [])
 
+        # Build run history for LLM context — shows every run attempt & outcome
+        run_history = []
+        for entry in prev:
+            run_history.append({
+                "status": "failed",
+                "classification": entry.get("classification", ""),
+                "error_summary": entry.get("error_log", "")[:1000],
+                "fix_applied": entry.get("diff_summary", entry.get("note", "")),
+            })
+        # Add current run
+        run_history.append({
+            "status": "failed",
+            "classification": category,
+            "error_summary": error_log[:1000],
+            "fix_applied": "(pending — this is the current failure to fix)",
+        })
+
         # ── Step 2: Decide action based on classification ───────────────
-        if category == "test_failure":
-            # Pipeline is working correctly — tests/lint/coverage just reported
-            # failures.  Mark the failing step as non-blocking.
+
+        # Count how many consecutive times this file has been classified as test_failure
+        consecutive_tf = 0
+        for entry in reversed(prev):
+            if entry.get("classification") == "test_failure":
+                consecutive_tf += 1
+            else:
+                break
+
+        if (
+            category == "test_failure"
+            and _allows_continue_on_error(pipeline_obj.filename)
+            and consecutive_tf >= _TEST_FAILURE_COE_THRESHOLD
+        ):
+            # The LLM has confirmed test_failure multiple times — the tool truly ran
+            # and the failures are genuine code bugs.  Apply continue-on-error.
             logger.info(
-                "Pipeline %s infrastructure is correct — classified as test_failure. "
-                "Adding continue-on-error to the failing step.",
-                pipeline_obj.filename,
+                "Pipeline %s classified as test_failure %d consecutive times — "
+                "the tool is running, applying continue-on-error.",
+                pipeline_obj.filename, consecutive_tf + 1,
             )
             fixed = fix_pipeline(
                 analysis, platform, pipeline_obj, run_info["name"], error_log,
                 fix_attempt=attempt,
                 use_continue_on_error=True,
+                run_history=run_history,
             )
             if rl:
                 rl.save_fix_attempt(
@@ -571,21 +818,45 @@ def fix_pipelines_node(state: PipelineState) -> dict:
             fixed_count += 1
             continue
 
+        if category == "test_failure" and not _allows_continue_on_error(pipeline_obj.filename):
+            # Security/scanning pipelines should never get continue-on-error.
+            # Reclassify as pipeline_config so the LLM does a real fix.
+            logger.info(
+                "Pipeline %s classified as test_failure but is a security/scanning "
+                "pipeline — reclassifying as pipeline_config for a real fix.",
+                pipeline_obj.filename,
+            )
+            category = "pipeline_config"
+
+        if category == "test_failure" and consecutive_tf < _TEST_FAILURE_COE_THRESHOLD:
+            # First time(s) classified as test_failure — try a normal fix first.
+            # The LLM might be wrong, or the issue might be fixable in the pipeline.
+            logger.info(
+                "Pipeline %s classified as test_failure (count %d/%d) — "
+                "trying a normal pipeline fix before resorting to continue-on-error.",
+                pipeline_obj.filename, consecutive_tf + 1, _TEST_FAILURE_COE_THRESHOLD,
+            )
+            category = "pipeline_config"
+
         if category == "missing_secret":
             # Count how many times we've already tried to fix this as missing_secret
             secret_attempts = sum(
                 1 for e in prev if e.get("classification") == "missing_secret"
             )
             if secret_attempts >= _SECRET_ATTEMPT_THRESHOLD:
+                use_coe = _allows_continue_on_error(pipeline_obj.filename)
                 logger.warning(
                     "Skipping %s — missing_secret after %d attempts. "
-                    "Adding continue-on-error with comment.",
+                    "%s",
                     pipeline_obj.filename, secret_attempts,
+                    "Adding continue-on-error." if use_coe
+                    else "Attempting normal fix (COE not allowed for this pipeline type).",
                 )
                 fixed = fix_pipeline(
                     analysis, platform, pipeline_obj, run_info["name"], error_log,
                     fix_attempt=attempt,
-                    use_continue_on_error=True,
+                    use_continue_on_error=use_coe,
+                    run_history=run_history,
                 )
                 if rl:
                     rl.save_fix_attempt(
@@ -636,6 +907,7 @@ def fix_pipelines_node(state: PipelineState) -> dict:
             fix_attempt=attempt,
             previous_attempts=failed_prev if failed_prev else None,
             applied_fixes=all_applied if all_applied else None,
+            run_history=run_history,
         )
 
         # Detect when LLM produces identical YAML (no real fix)
@@ -755,6 +1027,94 @@ def cleanup_node(state: PipelineState) -> dict:
     return {}
 
 
+# ── Final combined verification ─────────────────────────────────────────────
+
+
+def final_verify_push_node(state: PipelineState) -> dict:
+    """Push all pipelines (with a marker comment) to trigger a final combined run."""
+    _emit(state, "fix", "Running final combined verification — pushing all pipelines…")
+    logger.info("Final verify — pushing all pipelines for combined run.")
+    from datetime import datetime
+
+    # Touch each pipeline file to ensure git detects a change
+    for p in state["pipelines"]:
+        fpath = Path(state["clone_path"]) / p["filename"]
+        if fpath.exists():
+            content = fpath.read_text()
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            marker = "# final-verify-timestamp:"
+            lines = content.splitlines(keepends=True)
+            new_lines = [l for l in lines if marker not in l]
+            new_lines.insert(0, f"{marker} {ts}\n")
+            fpath.write_text("".join(new_lines))
+
+    commit_msg = "chore: final combined verification run via DevOps Guardian"
+    pushed = commit_and_push(state["clone_path"], state["branch_name"], commit_msg)
+    if not pushed:
+        logger.warning("Final verify push — no changes detected, forcing empty commit.")
+    return {}
+
+
+def final_verify_wait_node(state: PipelineState) -> dict:
+    """Wait for the final combined run and check results."""
+    analysis = RepoAnalysis(**state["analysis"])
+    _emit(state, "waiting", "Waiting for final combined verification run…")
+    logger.info("Final verify — waiting for combined workflow runs.")
+
+    total_pushed = len(set(p["filename"] for p in state["pipelines"]))
+    runs = wait_for_workflow_runs(
+        analysis.repo_url,
+        state["branch_name"],
+        expected_count=total_pushed,
+        cascade_workflow_names=None,
+    )
+
+    phase_keywords = _PHASE_KEYWORDS.get(1, set())
+    phase_runs = [
+        r for r in runs
+        if any(kw in r["name"].lower() for kw in phase_keywords)
+    ]
+    failed = [r for r in phase_runs if r["conclusion"] != "success"]
+    all_passed = len(failed) == 0 and len(phase_runs) > 0
+
+    # Emit per-run results for UI
+    for r in phase_runs:
+        conclusion = r.get("conclusion", "failure")
+        _emit(state, "run_result", r["name"], workflow=r["name"], conclusion=conclusion)
+
+    if all_passed:
+        _emit(state, "waiting", f"Final verification passed — all {len(phase_runs)} workflows succeeded!", passed=True)
+        logger.info("Final verify — all %d workflows passed.", len(phase_runs))
+    else:
+        failed_names = [r["name"] for r in failed]
+        _emit(state, "waiting", f"Final verification: {len(failed)} workflow(s) still failing: {', '.join(failed_names)}", passed=False)
+        logger.warning("Final verify — %d workflow(s) failed: %s", len(failed), failed_names)
+
+    # Remove the timestamp markers we added and push clean state
+    for p in state["pipelines"]:
+        fpath = Path(state["clone_path"]) / p["filename"]
+        if fpath.exists():
+            content = fpath.read_text()
+            marker = "# final-verify-timestamp:"
+            lines = content.splitlines(keepends=True)
+            cleaned = [l for l in lines if marker not in l]
+            fpath.write_text("".join(cleaned))
+    commit_and_push(
+        state["clone_path"], state["branch_name"],
+        "chore: remove verification markers",
+    )
+
+    return {"all_passed": all_passed, "failed_runs": failed}
+
+
+def after_final_verify(state: PipelineState) -> str:
+    """After the final combined verification — proceed to restructure or give up."""
+    if state.get("all_passed", False):
+        return "restructure"
+    logger.warning("Final combined verification failed. Creating PR with current state.")
+    return "give_up"
+
+
 def assemble_node(state: PipelineState) -> dict:
     """Assemble all generated pipelines into the final result."""
     analysis = RepoAnalysis(**state["analysis"])
@@ -784,6 +1144,8 @@ def build_graph() -> StateGraph:
     graph.add_node("push_and_pr", push_and_pr_node)
     graph.add_node("wait_for_runs", wait_for_runs_node)
     graph.add_node("fix_pipelines", fix_pipelines_node)
+    graph.add_node("final_verify_push", final_verify_push_node)
+    graph.add_node("final_verify_wait", final_verify_wait_node)
     graph.add_node("restructure", restructure_node)
     graph.add_node("write_restructured", write_files_node)
     graph.add_node("push_restructured", push_and_pr_node)
@@ -810,11 +1172,18 @@ def build_graph() -> StateGraph:
     graph.add_conditional_edges("wait_for_runs", should_retry, {
         "fix_pipelines": "fix_pipelines",
         "give_up": "cleanup",
-        "all_done": "restructure",
+        "all_done": "final_verify_push",
     })
 
     # Fix loop: fix → write → push → (back to wait/retry via after_push)
     graph.add_edge("fix_pipelines", "write_files")
+
+    # Final combined verification: push → wait → decide
+    graph.add_edge("final_verify_push", "final_verify_wait")
+    graph.add_conditional_edges("final_verify_wait", after_final_verify, {
+        "restructure": "restructure",
+        "give_up": "cleanup",
+    })
 
     # After all pass → restructure into production files → push → PR
     graph.add_edge("restructure", "write_restructured")
@@ -834,6 +1203,7 @@ def run_pipeline_generator(
     analysis: RepoAnalysis,
     run_dir: str = "",
     config: PipelineConfig | None = None,
+    progress_callback: Callable[..., None] | None = None,
 ) -> PipelineResult:
     """Run the full pipeline generation and return structured output."""
     if config is None:
@@ -853,11 +1223,13 @@ def run_pipeline_generator(
         "fix_attempts": 0,
         "all_passed": False,
         "failed_runs": [],
+        "passed_files": [],
         "fix_history": {},
         "last_push_had_changes": True,
         "current_phase": 1,
         "phase_failed": False,
         "run_dir": run_dir,
+        "progress_callback": progress_callback,
         "result": {},
     }
 

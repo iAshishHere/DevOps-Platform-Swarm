@@ -12,12 +12,14 @@ from devops_guardian.agents.code_analyser.scanners.cicd import detect_cicd
 from devops_guardian.agents.code_analyser.scanners.cloud import detect_cloud_providers
 from devops_guardian.agents.code_analyser.scanners.deployment import detect_deployment
 from devops_guardian.agents.code_analyser.scanners.docker import detect_docker
+from devops_guardian.agents.code_analyser.scanners.env_vars import detect_env_vars
 from devops_guardian.agents.code_analyser.scanners.frameworks import detect_frameworks
 from devops_guardian.agents.code_analyser.scanners.installed_packages import detect_installed_packages
 from devops_guardian.agents.code_analyser.scanners.languages import detect_languages
 from devops_guardian.agents.code_analyser.scanners.packages import detect_dependency_files, detect_package_managers
 from devops_guardian.agents.code_analyser.scanners.tests import detect_tests
 from devops_guardian.models.analysis import RepoAnalysis
+from devops_guardian.utils.github_ops import detect_github_features
 from devops_guardian.utils.repo_ops import build_file_tree, cleanup_repo, clone_repo
 from devops_guardian.utils.run_logger import RunLogger
 
@@ -105,6 +107,29 @@ def scan_node(state: AnalyserState) -> dict:
     if rl:
         rl.save_scanner("architecture", architecture)
 
+    # Detect GitHub repo features (code scanning, dependabot, secret scanning)
+    github_features = detect_github_features(state["repo_url"])
+    if rl:
+        rl.save_scanner("github_features", github_features)
+
+    # Detect required environment variables from source code
+    env_vars_raw = detect_env_vars(
+        repo_root, file_paths,
+        languages=[l.name for l in languages],
+        frameworks=frameworks,
+    )
+    if rl:
+        rl.save_scanner("env_vars", env_vars_raw)
+
+    # Merge actions_secrets from GitHub features into the GitHubFeatures model
+    # (detect_github_features returns extra keys beyond the model fields)
+    actions_secrets = github_features.pop("actions_secrets", [])
+    github_features["actions_secrets"] = actions_secrets
+    actions_variables = github_features.pop("actions_variables", [])
+    github_features["actions_variables"] = actions_variables
+    environment_vars = github_features.pop("environment_vars", {})
+    github_features["environment_vars"] = environment_vars
+
     analysis = RepoAnalysis(
         repo_url=state["repo_url"],
         branch=state.get("branch", ""),
@@ -119,6 +144,8 @@ def scan_node(state: AnalyserState) -> dict:
         deployment=deployment,
         cloud_providers=cloud,
         cicd=cicd,
+        github_features=github_features,
+        env_vars=env_vars_raw,
     )
 
     if rl:

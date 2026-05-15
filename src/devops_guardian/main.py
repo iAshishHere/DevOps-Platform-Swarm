@@ -71,11 +71,23 @@ def generate_pipelines(
     test_categories: list[str] = typer.Option([], "--test-category", "-t", help="Test categories to include (e.g. unit, e2e). Can be repeated. Empty = all discovered."),
 ) -> None:
     """Run Agent 2 (generate CI/CD pipelines). Optionally skip Agent 1 with --analysis-file."""
+    # Build selected_pipelines from the --no-* flags.
+    # When no flags are given, selected_pipelines stays empty → "generate everything".
+    selected: list[str] = []
+    _all_defaults = not no_ci and not no_coverage and not no_sonarqube and not no_security
+    if not _all_defaults:
+        if not no_ci:
+            selected.append("unit_tests")
+        if not no_coverage:
+            selected.append("coverage")
+        if not no_sonarqube:
+            selected.append("sonarqube")
+        if not no_security:
+            selected.extend(["secret_scanning", "vulnerability_scanning",
+                             "license_compliance", "sast", "container_scanning"])
+
     config = PipelineConfig(
-        enable_ci=not no_ci,
-        enable_coverage=not no_coverage,
-        enable_sonarqube=not no_sonarqube,
-        enable_security=not no_security,
+        selected_pipelines=selected,
         test_categories=test_categories,
     )
 

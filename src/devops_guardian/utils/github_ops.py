@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
 import time
@@ -10,6 +11,8 @@ import zipfile
 
 import requests as _requests
 from github import Github
+
+logger = logging.getLogger(__name__)
 
 
 def _get_github() -> Github:
@@ -29,6 +32,161 @@ def _parse_owner_repo(repo_url: str) -> tuple[str, str]:
     if not match:
         raise ValueError(f"Cannot parse GitHub owner/repo from URL: {repo_url}")
     return match.group(1), match.group(2)
+
+
+def detect_github_features(repo_url: str) -> dict:
+    """Probe the GitHub API to discover which security features are enabled.
+
+    Returns a dict matching the GitHubFeatures model fields.
+    """
+    from devops_guardian.models.analysis import GitHubFeatures
+
+    owner, repo_name = _parse_owner_repo(repo_url)
+    token = os.environ.get("GITHUB_TOKEN", "")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+    }
+    base = f"https://api.github.com/repos/{owner}/{repo_name}"
+    features = GitHubFeatures()
+
+    # 1. Basic repo metadata
+    try:
+        resp = _requests.get(base, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            features.is_private = data.get("private", False)
+            features.default_branch = data.get("default_branch", "main")
+    except Exception as e:
+        logger.warning("Failed to fetch repo metadata: %s", e)
+
+    # 2. Code scanning — try listing alerts; 403/404 = not enabled
+    try:
+        resp = _requests.get(
+            f"{base}/code-scanning/alerts",
+            headers=headers, params={"per_page": 1}, timeout=10,
+        )
+        features.code_scanning_enabled = resp.status_code in (200, 304)
+    except Exception:
+        pass
+
+    # 3. Dependabot alerts
+    try:
+        resp = _requests.get(
+            f"{base}/dependabot/alerts",
+            headers=headers, params={"per_page": 1}, timeout=10,
+        )
+        features.dependabot_alerts_enabled = resp.status_code in (200, 304)
+    except Exception:
+        pass
+
+    # 4. Secret scanning — check via security-and-analysis endpoint
+    try:
+        resp = _requests.get(
+            f"{base}/secret-scanning/alerts",
+            headers=headers, params={"per_page": 1}, timeout=10,
+        )
+        features.secret_scanning_enabled = resp.status_code in (200, 304)
+    except Exception:
+        pass
+
+    logger.info(
+        "GitHub features for %s/%s: code_scanning=%s, dependabot=%s, "
+        "secret_scanning=%s, private=%s",
+        owner, repo_name,
+        features.code_scanning_enabled,
+        features.dependabot_alerts_enabled,
+        features.secret_scanning_enabled,
+        features.is_private,
+    )
+
+    result = features.model_dump()
+
+    # 5. GitHub Actions secrets — list names (not values) for env var mapping
+    secret_names: list[str] = []
+    try:
+        resp = _requests.get(
+            f"{base}/actions/secrets",
+            headers=headers, params={"per_page": 100}, timeout=10,
+        )
+        if resp.status_code == 200:
+            for s in resp.json().get("secrets", []):
+                secret_names.append(s["name"])
+            logger.info(
+                "GitHub Actions secrets for %s/%s: %s",
+                owner, repo_name, secret_names or "(none)",
+            )
+    except Exception as e:
+        logger.warning("Failed to fetch GitHub Actions secrets: %s", e)
+
+    result["actions_secrets"] = secret_names
+
+    # 6. GitHub Actions repository variables (non-secret env vars)
+    repo_variables: list[str] = []
+    try:
+        resp = _requests.get(
+            f"{base}/actions/variables",
+            headers=headers, params={"per_page": 100}, timeout=10,
+        )
+        if resp.status_code == 200:
+            for v in resp.json().get("variables", []):
+                repo_variables.append(v["name"])
+            logger.info(
+                "GitHub Actions variables for %s/%s: %s",
+                owner, repo_name, repo_variables or "(none)",
+            )
+    except Exception as e:
+        logger.warning("Failed to fetch GitHub Actions variables: %s", e)
+
+    result["actions_variables"] = repo_variables
+
+    # 7. GitHub Environments and their secrets/variables
+    environment_vars: dict[str, list[str]] = {}  # env_name → [var_names]
+    try:
+        resp = _requests.get(
+            f"{base}/environments",
+            headers=headers, params={"per_page": 30}, timeout=10,
+        )
+        if resp.status_code == 200:
+            for env in resp.json().get("environments", []):
+                env_name = env["name"]
+                env_var_names: list[str] = []
+                # Get environment secrets
+                try:
+                    sec_resp = _requests.get(
+                        f"{base}/environments/{env_name}/secrets",
+                        headers=headers, params={"per_page": 100}, timeout=10,
+                    )
+                    if sec_resp.status_code == 200:
+                        for s in sec_resp.json().get("secrets", []):
+                            env_var_names.append(s["name"])
+                except Exception:
+                    pass
+                # Get environment variables
+                try:
+                    var_resp = _requests.get(
+                        f"{base}/environments/{env_name}/variables",
+                        headers=headers, params={"per_page": 100}, timeout=10,
+                    )
+                    if var_resp.status_code == 200:
+                        for v in var_resp.json().get("variables", []):
+                            env_var_names.append(v["name"])
+                except Exception:
+                    pass
+                if env_var_names:
+                    environment_vars[env_name] = env_var_names
+            if environment_vars:
+                logger.info(
+                    "GitHub Environments for %s/%s: %s",
+                    owner, repo_name,
+                    {k: len(v) for k, v in environment_vars.items()},
+                )
+    except Exception as e:
+        logger.warning("Failed to fetch GitHub environments: %s", e)
+
+    result["environment_vars"] = environment_vars
+
+    return result
 
 
 def create_pull_request(
