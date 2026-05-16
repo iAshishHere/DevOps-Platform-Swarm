@@ -372,7 +372,7 @@ def generate_phase_node(state: PipelineState) -> dict:
 
     # ── CI pipeline (test/build job) ────────────────────────────────────
     if config.has("unit_tests"):
-        ci_pipeline = generate_ci(analysis, platform)
+        ci_pipeline = generate_ci(analysis, platform, config)
         logger.info("  → Base CI pipeline generated.")
         _emit(state, "generate", "CI pipeline generated (test/build job).")
         ci_content = ci_pipeline.content

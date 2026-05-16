@@ -110,11 +110,9 @@ Requirements:
    - If marked as available as a GitHub variable → `VAR_NAME: ${{{{ vars.VAR_NAME }}}}`
    - If NOT available anywhere → `VAR_NAME: ""  # TODO: Configure this secret in GitHub Settings → Secrets`
    This makes the pipeline self-documenting — the developer sees exactly what to configure.
-3. Run linting / static checks appropriate for the detected languages and frameworks.
-4. Run the test suite using the detected test frameworks.
-5. Build the application (compile, bundle, or docker build as appropriate).
-6. Use caching for dependencies where supported.
-7. Trigger on push to ALL branches — do NOT add a `branches:` filter under `push:`.
+{ci_jobs_instructions}
+3. Use caching for dependencies where supported.
+4. Trigger on push to ALL branches — do NOT add a `branches:` filter under `push:`.
    For `pull_request:`, filter to the '{default_branch}' branch ONLY.
    CRITICAL: '{default_branch}' is the EXACT, LITERAL branch name — not a description.
    Example trigger block:
@@ -122,16 +120,17 @@ Requirements:
        push:
        pull_request:
          branches: ['{default_branch}']
-8. Use the correct test command for the detected framework (e.g. pytest, npm test,
+5. Use the correct test command for the detected framework (e.g. pytest, npm test,
    mvn test, go test, dotnet test, manage.py test for Django, etc.).
    Run commands from the correct working directory based on the dependency file paths.
    Ensure test output (pass/fail counts, error messages) is visible in the GitHub Actions
    logs — do not redirect output only to a file.
-9. Do NOT add `continue-on-error: true` on test, lint, or build steps. If a step fails
+6. Do NOT add `continue-on-error: true` on test, lint, or build steps. If a step fails
    (due to missing env vars, import errors, or test failures), the workflow MUST report
    failure so the self-healing fix loop can diagnose the root cause. The fix loop will
    add `continue-on-error` later if the failure is confirmed to be a test assertion issue
    rather than an infrastructure/configuration problem.
+7. ONLY include jobs listed above. Do NOT add extra jobs the user did not select.
 
 Output ONLY the YAML content for the pipeline file.
 """

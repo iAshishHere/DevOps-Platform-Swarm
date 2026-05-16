@@ -34,7 +34,7 @@ from devops_guardian.agents.pipeline_generator.prompts import (
     VULNERABILITY_SCANNING_PIPELINE_PROMPT,
 )
 from devops_guardian.models.analysis import RepoAnalysis
-from devops_guardian.models.pipeline import PipelineFile
+from devops_guardian.models.pipeline import PipelineConfig, PipelineFile
 from devops_guardian.utils.llm import get_llm
 
 
@@ -233,10 +233,25 @@ def _get_coverage_dependency_config(platform: str) -> str:
     return "Configure this pipeline to run only after the coverage pipeline passes."
 
 
-def generate_ci(analysis: RepoAnalysis, platform: str) -> PipelineFile:
+def generate_ci(analysis: RepoAnalysis, platform: str, config: "PipelineConfig | None" = None) -> PipelineFile:
     """Generate the main CI pipeline."""
     ctx = _format_context(analysis)
     ctx["platform"] = platform
+
+    # Build the jobs instruction list based on what the user selected.
+    # When config is None or selected_pipelines is empty, include everything.
+    job_lines: list[str] = []
+    include_all = config is None or not config.selected_pipelines
+
+    if include_all or config.has("linting"):
+        job_lines.append("- Run linting / static checks appropriate for the detected languages and frameworks.")
+    if include_all or config.has("unit_tests"):
+        job_lines.append("- Run the test suite using the detected test frameworks.")
+    if include_all:
+        job_lines.append("- Build the application (compile, bundle, or docker build as appropriate).")
+
+    ctx["ci_jobs_instructions"] = "\n".join(job_lines)
+
     yaml_content = _call_llm(CI_PIPELINE_PROMPT, ctx)
     return PipelineFile(
         filename=pipeline_filepath(platform, "ci"),
